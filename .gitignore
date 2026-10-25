@@ -1,0 +1,9 @@
+.venv/
+__pycache__/
+.ipynb_checkpoints/
+*_files/
+.quarto/
+.DS_Store
+
+# entrega em Quarto (.qmd); o notebook fica só local
+*.ipynb

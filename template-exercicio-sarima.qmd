@@ -1,0 +1,792 @@
+---
+title: 'Exercício: SARIMA no comércio varejista brasileiro'
+subtitle: PMC/IBGE · varejo ampliado · São Paulo — Financial Analytics, Insper PADS
+author:
+  - name: Luiz Felipe Possebon
+    affiliation: Insper — PADS, Financial Analytics
+date: today
+date-format: "DD/MM/YYYY"
+lang: pt-BR
+language:
+  title-block-author-single: "Aluno"
+  title-block-affiliation-single: "Curso"
+  title-block-published: "Data"
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    number-sections: true
+    code-fold: true
+    code-tools: true
+    embed-resources: true
+    fig-align: center
+jupyter: python3
+---
+
+
+## Sobre o exercício
+
+A base é a **PMC** (Pesquisa Mensal do Comércio) do IBGE: índice de volume de vendas no **comércio varejista ampliado** (inclui veículos e materiais de construção), por **Unidade da Federação**, mensal de jan/2004 em diante. Base 2022 = 100, **sem ajuste sazonal**.
+
+**UF analisada: São Paulo.**
+
+Passos pedidos no enunciado:
+
+3. Análise descritiva (linha, ACF, PACF, diferenciação) e diagnóstico de tendência/sazonalidade.
+4. Testes de raiz unitária (ADF, KPSS) e estimativa de `ndiffs`.
+5. Ajuste de SARIMA via `AutoARIMA(season_length=12)`.
+6. Diagnóstico dos resíduos.
+7. Previsão de 24 meses à frente, com intervalos de 80% e 95%.
+8. Discussão dos resultados.
+
+### Roteiro metodológico
+
+Este relatório segue, **na ordem**, o procedimento **Box-Jenkins**, conforme apresentado em aula:
+
+| Etapa Box-Jenkins | Seção deste relatório | Conceitos e ferramentas |
+|---|---|---|
+| **1. Identificação**: componentes, ACF/PACF, $d$ e $D$ | 5 · Análise descritiva<br>6 · Testes de raiz unitária | componentes e decomposição STL, ACF/PACF, testes ADF + KPSS, diferenciação regular e sazonal |
+| **2. Estimação**: MLE + AICc | 7 · Modelagem | SARIMA estimado por máxima verossimilhança, seleção via `AutoARIMA` (Hyndman-Khandakar) |
+| **3. Diagnóstico**: resíduos = ruído branco? | 8 · Diagnóstico dos resíduos | resíduos no tempo, ACF residual, normalidade, teste de Ljung-Box |
+| **4. Previsão** com intervalos | 9 · Previsão | previsão de 24 meses com intervalos de 80% e 95% |
+
+A análise descritiva segue a ordem recomendada em aula para séries sazonais (é também a ordem interna do `AutoARIMA`):
+
+1. gráfico da série completa;
+2. decomposição STL;
+3. boxplot por mês;
+4. ACF da série original;
+5. ACF/PACF de $\Delta_{12} Y_t$ e teste de raiz unitária.
+
+Primeiro se remove a sazonalidade e só depois se decide se ainda falta a diferença regular ($D \to d$).
+
+## Setup
+
+Imports do template, mais as bibliotecas para STL, diagnóstico de resíduos e `ndiffs`/`nsdiffs`, e o estilo dos gráficos.
+
+```{python}
+#| execution: {iopub.execute_input: '2026-10-24T14:29:15.548479Z', iopub.status.busy: '2026-10-24T14:29:15.548364Z', iopub.status.idle: '2026-10-24T14:29:17.366525Z', shell.execute_reply: '2026-10-24T14:29:17.366033Z'}
+import warnings
+warnings.filterwarnings('ignore')
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from scipy import stats
+
+from statsmodels.tsa.stattools import adfuller, kpss, acf
+from statsmodels.tsa.seasonal import STL
+from statsmodels.graphics.tsaplots import plot_acf, plot_pacf
+from statsmodels.graphics.gofplots import qqplot
+from statsmodels.stats.diagnostic import acorr_ljungbox
+
+from statsforecast import StatsForecast
+from statsforecast.models import AutoARIMA, ARIMA
+from statsforecast.arima import ndiffs, nsdiffs, seas_heuristic
+
+# Estilo dos gráficos
+plt.rcParams.update({
+    'figure.figsize': (12, 5),
+    'axes.spines.top': False,
+    'axes.spines.right': False,
+    'axes.grid': True,
+    'grid.alpha': 0.3,
+    'font.size': 11,
+})
+
+INSPER_RED = '#E50505'
+INSPER_TURQUESA = '#3ACC9F'
+INSPER_AMARELO = '#FFCC00'
+INSPER_GRAY = '#5B5B5B'
+INSPER_ROXO = '#730D9F'
+
+S = 12                                                     # período sazonal (mensal → anual)
+COVID = (pd.Timestamp('2020-03-01'), pd.Timestamp('2020-08-01'))
+RECESSAO = (pd.Timestamp('2014-04-01'), pd.Timestamp('2016-12-01'))
+
+MESES = ['jan', 'fev', 'mar', 'abr', 'mai', 'jun', 'jul', 'ago', 'set', 'out', 'nov', 'dez']
+
+
+def mes_ano(ts):
+    """Timestamp → 'jan/2004' (independe do locale do sistema)."""
+    return f"{MESES[ts.month - 1]}/{ts.year}"
+```
+
+### Funções auxiliares
+
+Os gráficos de ACF/PACF marcam os lags sazonais (12, 24, 36), e o teste de estacionariedade devolve uma **tabela**, para comparar várias transformações lado a lado. A conclusão conjunta segue a lógica de triangulação ADF × KPSS.
+
+```{python}
+#| execution: {iopub.execute_input: '2026-10-24T14:29:17.367781Z', iopub.status.busy: '2026-10-24T14:29:17.367670Z', iopub.status.idle: '2026-10-24T14:29:17.371789Z', shell.execute_reply: '2026-10-24T14:29:17.371361Z'}
+def marcar_sazonais(ax, s=S, max_lag=36):
+    """Linhas verticais nos lags sazonais s, 2s, 3s..."""
+    for lag in range(s, max_lag + 1, s):
+        ax.axvline(lag, color=INSPER_AMARELO, lw=6, alpha=0.25, zorder=0)
+
+
+def plotar_diagnostico(serie, titulo, lags=36):
+    """Série no topo; ACF e PACF lado a lado (lags sazonais destacados)."""
+    serie = serie.dropna()
+    fig = plt.figure(figsize=(13, 7))
+    gs = fig.add_gridspec(2, 2, height_ratios=[1, 1])
+    ax0 = fig.add_subplot(gs[0, :])
+    ax0.plot(serie.index, serie.values, color=INSPER_RED, lw=1)
+    ax0.axhline(serie.mean(), color=INSPER_GRAY, ls='--', alpha=0.6)
+    ax0.axvspan(*COVID, color=INSPER_AMARELO, alpha=0.25, label='Covid (mar–ago/2020)')
+    ax0.set_title(titulo, fontweight='bold')
+    ax0.legend(loc='upper left', fontsize=9)
+
+    ax1 = fig.add_subplot(gs[1, 0])
+    plot_acf(serie, ax=ax1, lags=lags, zero=False, color=INSPER_GRAY,
+             vlines_kwargs={'colors': INSPER_GRAY})
+    marcar_sazonais(ax1, max_lag=lags)
+    ax1.set_title('ACF')
+
+    ax2 = fig.add_subplot(gs[1, 1])
+    plot_pacf(serie, ax=ax2, lags=lags, zero=False, method='ywm', color=INSPER_GRAY,
+              vlines_kwargs={'colors': INSPER_GRAY})
+    marcar_sazonais(ax2, max_lag=lags)
+    ax2.set_title('PACF')
+    plt.tight_layout()
+    plt.show()
+
+
+def resumo_acf(serie, lags=(1, 2, 3, 12, 13, 24, 36)):
+    """ACF e PACF em lags-chave + lista de lags significativos (banda ±1,96/√n)."""
+    from statsmodels.tsa.stattools import pacf
+    s = serie.dropna()
+    ac, pa = acf(s, nlags=36), pacf(s, nlags=36, method='ywm')
+    banda = 1.96 / np.sqrt(len(s))
+    tab = pd.DataFrame({'ACF': ac[list(lags)], 'PACF': pa[list(lags)]},
+                       index=pd.Index(lags, name='lag')).T.round(2)
+    print(f"Banda de significância: ±{banda:.3f}  (n = {len(s)})")
+    print("Lags significativos na ACF: ", [l for l in range(1, 37) if abs(ac[l]) > banda])
+    print("Lags significativos na PACF:", [l for l in range(1, 37) if abs(pa[l]) > banda])
+    return tab
+
+
+def testar_estacionariedade(series, alpha=0.05):
+    """ADF (H0: raiz unitária) e KPSS (H0: estacionária) para um dicionário de séries."""
+    linhas = {}
+    for nome, serie in series.items():
+        s = serie.dropna()
+        adf_stat, adf_p, adf_lags, *_ = adfuller(s, autolag='AIC')
+        with warnings.catch_warnings():                      # p-valor fora da tabela → aviso; tratamos abaixo
+            warnings.simplefilter('ignore')
+            kpss_stat, kpss_p, *_ = kpss(s, regression='c', nlags='auto')
+        # o KPSS tabula p-valores só entre 0,01 e 0,10 → fora disso, reportamos o limite
+        kpss_txt = ('< 0.01' if kpss_p <= 0.01 else '> 0.10' if kpss_p >= 0.10
+                    else f'{kpss_p:.3f}')
+        adf_rejeita, kpss_rejeita = adf_p < alpha, kpss_p < alpha
+        if adf_rejeita and not kpss_rejeita:
+            conclusao = '✅ estacionária'
+        elif not adf_rejeita and kpss_rejeita:
+            conclusao = '⚠️ raiz unitária → diferenciar'
+        elif adf_rejeita and kpss_rejeita:
+            conclusao = '❓ inconclusivo (ambos rejeitam)'
+        else:
+            conclusao = '❓ inconclusivo (nenhum rejeita)'
+        linhas[nome] = {'n': len(s), 'ADF estat.': round(adf_stat, 3),
+                        'ADF p-valor': round(adf_p, 4), 'ADF lags': adf_lags,
+                        'KPSS estat.': round(kpss_stat, 3), 'KPSS p-valor': kpss_txt,
+                        'Conclusão conjunta': conclusao}
+    return pd.DataFrame(linhas).T
+```
+
+## Carregando a base PMC
+
+A base já foi pré-processada para conter apenas as colunas relevantes, e já no formato "long" (uma linha por data + UF). O nome da coluna de data é "data", e a coluna de interesse (índice de volume) é "volume_idx". A coluna "uf" indica a Unidade da Federação.
+
+```{python}
+#| execution: {iopub.execute_input: '2026-10-24T14:29:17.372686Z', iopub.status.busy: '2026-10-24T14:29:17.372631Z', iopub.status.idle: '2026-10-24T14:29:17.723863Z', shell.execute_reply: '2026-10-24T14:29:17.723144Z'}
+pmc = pd.read_csv("https://github.com/padsInsper/202634-fa/releases/download/data/pmc_volume_uf.csv")
+pmc['data'] = pd.to_datetime(pmc['data'])
+
+print(f"Dimensões: {pmc.shape[0]} linhas × {pmc.shape[1]} colunas")
+print(f"Período:   {mes_ano(pmc['data'].min())} → {mes_ano(pmc['data'].max())}")
+print(f"UFs:       {pmc['uf'].nunique()}")
+print(f"Valores ausentes por coluna: {pmc.isna().sum().to_dict()}")
+pmc.head()
+```
+
+## Escolha sua UF
+
+O `statsforecast` usa o formato Nixtla: `unique_id`, `ds`, `y`. Para as análises com `statsmodels`, também guardamos a série como `pd.Series` indexada por data, com frequência mensal (`MS`).
+
+```{python}
+#| execution: {iopub.execute_input: '2026-10-24T14:29:17.725694Z', iopub.status.busy: '2026-10-24T14:29:17.725582Z', iopub.status.idle: '2026-10-24T14:29:17.735217Z', shell.execute_reply: '2026-10-24T14:29:17.734757Z'}
+MINHA_UF = "São Paulo"
+
+
+df_sf = (
+    pmc.query("uf == @MINHA_UF")
+    .rename(columns={"uf": "unique_id", "data": "ds", "volume_idx": "y"})
+    [["unique_id", "ds", "y"]]
+    .reset_index(drop=True)
+)
+
+# Série indexada por data, para statsmodels (STL, ACF/PACF, ADF/KPSS)
+y = df_sf.set_index('ds')['y'].asfreq('MS')
+y.name = 'volume_idx'
+
+print(f"{MINHA_UF}: {len(y)} meses ({mes_ano(y.index[0])} → {mes_ano(y.index[-1])}), "
+      f"{y.isna().sum()} valores ausentes")
+df_sf.head()
+```
+
+```{python}
+#| execution: {iopub.execute_input: '2026-10-24T14:29:17.736731Z', iopub.status.busy: '2026-10-24T14:29:17.736635Z', iopub.status.idle: '2026-10-24T14:29:17.744665Z', shell.execute_reply: '2026-10-24T14:29:17.744233Z'}
+# Estatísticas descritivas e média anual (2026 tem só jan–fev)
+display(y.describe().round(2).to_frame().T)
+media_anual = y.groupby(y.index.year).mean().round(1)
+media_anual.to_frame('média anual').T
+```
+
+## Análise descritiva
+
+Esta é a **Etapa 1 do Box-Jenkins (Identificação)**. Antes de qualquer modelo, olhamos a série por cinco ângulos, na ordem descrita acima.
+
+### Gráfico de linha
+
+Junto com a série, plotamos a média móvel centrada de 12 meses. Ela elimina a sazonalidade anual e mostra a tendência/ciclo.
+
+```{python}
+#| execution: {iopub.execute_input: '2026-10-24T14:29:17.745948Z', iopub.status.busy: '2026-10-24T14:29:17.745871Z', iopub.status.idle: '2026-10-24T14:29:17.836916Z', shell.execute_reply: '2026-10-24T14:29:17.836507Z'}
+mm12 = y.rolling(12, center=True).mean()
+
+fig, ax = plt.subplots(figsize=(13, 5))
+ax.plot(y.index, y.values, color=INSPER_GRAY, lw=1, label='Índice de volume (sem ajuste sazonal)')
+ax.plot(mm12.index, mm12.values, color=INSPER_RED, lw=2.2, label='Média móvel centrada 12m')
+ax.axvspan(*RECESSAO, color=INSPER_ROXO, alpha=0.10, label='Recessão 2014–16')
+ax.axvspan(*COVID, color=INSPER_AMARELO, alpha=0.35, label='Covid (mar–ago/2020)')
+for dez in y[y.index.month == 12].index:          # marca os dezembros
+    ax.plot(dez, y[dez], 'o', color=INSPER_RED, ms=3.5)
+ax.set_title(f'PMC — varejo ampliado, {MINHA_UF} (base 2022 = 100)', fontweight='bold')
+ax.set_ylabel('Índice de volume')
+ax.legend(loc='upper left', fontsize=9)
+plt.tight_layout(); plt.show()
+```
+
+**Observe e anote:**
+
+1. **Tendência?** Sim, e não é linear: parece uma **tendência estocástica** (o nível "vagueia").
+    - O índice sobe de ≈ 58 (média de 2004) até ≈ 110 (2013).
+    - Cai cerca de 18% na recessão 2014–16 (≈ 90 em 2016).
+    - Recupera até ≈ 103 em 2019 e, desde 2021, oscila ao redor de 100–104.
+    - Uma tendência determinística, $\alpha + \beta t$, não descreveria essa trajetória. O padrão é típico de raiz unitária.
+2. **Sazonalidade?** Sim, **anual ($s = 12$)** e muito nítida. Os pontos vermelhos (dezembros) são sempre o pico do ano (Natal e 13º salário). Fevereiro e janeiro aparecem como vales.
+3. **Outliers ou quebras?**
+    - A quebra mais visível é o **Covid**: o índice cai de 92,7 (mar/2020) para 68,7 (abr/2020) e volta a ≈ 104 já em jul/2020.
+    - A recessão de 2014–16 é uma mudança de nível mais lenta, não um outlier.
+4. **Variância constante?** Não exatamente. A amplitude do zigue-zague sazonal **cresce** com o nível até 2013–14 e depois **encolhe**, mesmo com o nível estável. Isso sugere uma sazonalidade que **muda ao longo do tempo**, o que a STL e o boxplot vão confirmar.
+
+### Decomposição STL
+
+Usamos a STL robusta (`robust=True`, para o choque do Covid não distorcer os componentes). A partir dela calculamos as **forças de tendência e de sazonalidade** (Wang, Smith & Hyndman, 2006), as mesmas que o `AutoARIMA` usa para decidir $D$:
+
+$$F_T = \max\left\{0,\ 1 - \frac{\mathrm{Var}(R_t)}{\mathrm{Var}(T_t + R_t)}\right\}, \qquad
+F_S = \max\left\{0,\ 1 - \frac{\mathrm{Var}(R_t)}{\mathrm{Var}(S_t + R_t)}\right\}$$
+
+```{python}
+#| execution: {iopub.execute_input: '2026-10-24T14:29:17.838021Z', iopub.status.busy: '2026-10-24T14:29:17.837954Z', iopub.status.idle: '2026-10-24T14:29:17.941356Z', shell.execute_reply: '2026-10-24T14:29:17.940959Z'}
+stl = STL(y, period=S, robust=True).fit()
+
+fig, axes = plt.subplots(4, 1, figsize=(13, 10), sharex=True)
+componentes = {'Observado': y, 'Tendência': stl.trend,
+               'Sazonalidade': stl.seasonal, 'Resíduo': stl.resid}
+cores = [INSPER_GRAY, INSPER_RED, INSPER_TURQUESA, INSPER_ROXO]
+for ax, (nome, comp), cor in zip(axes, componentes.items(), cores):
+    ax.plot(comp.index, comp.values, color=cor, lw=1)
+    ax.set_ylabel(nome, fontweight='bold')
+axes[3].axhline(0, color='gray', ls='--', alpha=0.5)
+plt.suptitle(f'Decomposição STL — PMC {MINHA_UF}', fontsize=14, fontweight='bold')
+plt.tight_layout(); plt.show()
+
+F_T = max(0, 1 - np.var(stl.resid) / np.var(stl.trend + stl.resid))
+F_S = max(0, 1 - np.var(stl.resid) / np.var(stl.seasonal + stl.resid))
+print(f"Força da tendência     F_T = {F_T:.2f}")
+print(f"Força da sazonalidade  F_S = {F_S:.2f}   (limiar do AutoARIMA para aplicar Δ12: 0,64)")
+```
+
+```{python}
+#| execution: {iopub.execute_input: '2026-10-24T14:29:17.942427Z', iopub.status.busy: '2026-10-24T14:29:17.942346Z', iopub.status.idle: '2026-10-24T14:29:17.983417Z', shell.execute_reply: '2026-10-24T14:29:17.982907Z'}
+# A sazonalidade é estável? Amplitude anual do componente sazonal (máx − mín), anos completos
+amplitude = stl.seasonal.groupby(stl.seasonal.index.year).agg(lambda s: s.max() - s.min())
+amplitude = amplitude[amplitude.index < 2026]
+
+fig, ax = plt.subplots(figsize=(13, 3.5))
+ax.bar(amplitude.index, amplitude.values, color=INSPER_TURQUESA)
+ax.set_title('Amplitude do componente sazonal da STL por ano (pontos de índice)', fontweight='bold')
+ax.set_ylabel('máx − mín')
+plt.tight_layout(); plt.show()
+
+amplitude.round(1).to_frame('amplitude').T
+```
+
+**Leitura.**
+
+- **$F_T \approx 0{,}95$** e **$F_S \approx 0{,}77$**: os dois componentes são fortes. Pela heurística do `AutoARIMA`, $F_S > 0{,}64$ já indica que haverá **diferença sazonal ($D = 1$)**.
+- A tendência STL reproduz o ciclo da economia: expansão até 2013, recessão 2014–16, recuperação, Covid e estabilidade recente.
+- No componente sazonal, dezembro fica cerca de 17 pontos acima da tendência e fevereiro cerca de 9 abaixo.
+- A **amplitude sazonal não é constante**. Ela vai de ≈ 24 pontos (2004) a ≈ 33 (2014) e cai para ≈ 19 (2025).
+    - Até 2014, a amplitude acompanha o nível, um comportamento de tipo multiplicativo.
+    - Depois de 2014, encolhe com o nível estável, ou seja, a sazonalidade **evolui**.
+- Pela distinção entre sazonalidade determinística e estocástica, isso aponta para uma **sazonalidade estocástica**. Ela se trata com $\Delta_{12}$ e termos $(P, Q)$, e não com dummies fixas de mês.
+- O resíduo da STL é pequeno, exceto no **Covid** (abr/2020), exatamente o que a versão robusta isola.
+
+### Boxplot por mês e gráfico sazonal
+
+O boxplot mostra o **perfil médio** de cada mês. O gráfico sazonal (uma linha por ano) e a razão "mês ÷ média do ano" mostram se esse perfil **muda ao longo do tempo**.
+
+```{python}
+#| execution: {iopub.execute_input: '2026-10-24T14:29:17.984509Z', iopub.status.busy: '2026-10-24T14:29:17.984447Z', iopub.status.idle: '2026-10-24T14:29:18.124275Z', shell.execute_reply: '2026-10-24T14:29:18.123902Z'}
+meses = MESES
+dados = pd.DataFrame({'y': y, 'ano': y.index.year, 'mes': y.index.month})
+
+fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+
+# (a) Boxplot por mês
+dados.boxplot(column='y', by='mes', ax=axes[0], grid=False, patch_artist=True,
+              boxprops=dict(facecolor=INSPER_TURQUESA, alpha=0.5, color=INSPER_GRAY),
+              medianprops=dict(color=INSPER_RED, lw=2),
+              whiskerprops=dict(color=INSPER_GRAY), capprops=dict(color=INSPER_GRAY),
+              flierprops=dict(markeredgecolor=INSPER_GRAY))
+axes[0].set_xticklabels(meses)
+axes[0].set_title('(a) Boxplot por mês'); axes[0].set_xlabel(''); axes[0].set_ylabel('Índice')
+
+# (b) Gráfico sazonal: uma linha por ano, cor do mais antigo (claro) ao mais recente (escuro)
+anos = sorted(dados['ano'].unique())
+cmap = plt.cm.Reds(np.linspace(0.25, 1, len(anos)))
+for cor, ano in zip(cmap, anos):
+    d = dados[dados['ano'] == ano]
+    axes[1].plot(d['mes'], d['y'], color=cor, lw=1.2)
+    axes[1].text(d['mes'].iloc[-1] + 0.1, d['y'].iloc[-1], str(ano), fontsize=7, color=cor, va='center')
+axes[1].set_xticks(range(1, 13)); axes[1].set_xticklabels(meses)
+axes[1].set_title('(b) Gráfico sazonal (uma linha por ano)')
+plt.suptitle(''); plt.tight_layout(); plt.show()
+```
+
+```{python}
+#| execution: {iopub.execute_input: '2026-10-24T14:29:18.125412Z', iopub.status.busy: '2026-10-24T14:29:18.125348Z', iopub.status.idle: '2026-10-24T14:29:18.170820Z', shell.execute_reply: '2026-10-24T14:29:18.170402Z'}
+# Peso de cada mês no próprio ano: valor do mês ÷ média do ano (anos completos)
+completos = dados[dados['ano'] < 2026]
+razao = completos['y'] / completos.groupby('ano')['y'].transform('mean')
+razao = razao.groupby([completos['ano'], completos['mes']]).first().unstack()
+razao.columns = meses
+
+fig, ax = plt.subplots(figsize=(13, 3.8))
+for mes, cor in [('dez', INSPER_RED), ('nov', INSPER_ROXO), ('fev', INSPER_TURQUESA)]:
+    ax.plot(razao.index, razao[mes], 'o-', color=cor, lw=1.5, ms=4, label=mes)
+ax.axhline(1, color='gray', ls='--', alpha=0.6)
+ax.set_title('Valor do mês ÷ média do ano — dezembro perde peso ao longo do tempo', fontweight='bold')
+ax.legend(); plt.tight_layout(); plt.show()
+
+razao[['jan', 'fev', 'nov', 'dez']].iloc[::3].round(3).T
+```
+
+**Leitura.**
+
+- **Perfil sazonal:**
+    - **Dezembro** é o grande pico. Em média, vale ≈ 20% acima da média do ano.
+    - **Fevereiro** (mês curto e com Carnaval) e **janeiro** são os vales.
+    - **Abril, junho e setembro** ficam um pouco abaixo da média.
+    - **Novembro** vem logo acima, antecipando parte das compras de fim de ano.
+- **A caixa de cada mês é larga** porque a série tem **tendência**: o mesmo mês vale ≈ 55 em 2004 e ≈ 100 em 2024. É mais um sinal de que o nível precisa ser diferenciado antes de modelar.
+- **O perfil sazonal muda.**
+    - No gráfico sazonal, as linhas recentes (escuras) têm um pico de dezembro relativamente menor.
+    - Na razão mês ÷ média anual, o peso de dezembro cai de ≈ 1,28 (2004) para ≈ 1,11 (2025).
+    - Uma hipótese é a redistribuição das compras de fim de ano, com a Black Friday em novembro e o comércio eletrônico, mas os dados não permitem testá-la.
+    - Seja qual for a causa, uma sazonalidade que se desloca é **estocástica**, coerente com $D = 1$.
+
+### ACF e PACF da série original
+
+```{python}
+#| execution: {iopub.execute_input: '2026-10-24T14:29:18.171916Z', iopub.status.busy: '2026-10-24T14:29:18.171855Z', iopub.status.idle: '2026-10-24T14:29:18.271931Z', shell.execute_reply: '2026-10-24T14:29:18.271601Z'}
+plotar_diagnostico(y, f'Série original (nível) — PMC {MINHA_UF}')
+resumo_acf(y)
+```
+
+**Leitura.**
+
+- **ACF:** $\rho_1 \approx 0{,}85$, com **decaimento muito lento**. Todos os 36 lags ficam fora da banda.
+    - Pela regra de identificação ("ACF não decai → não estacionário"), essa é a assinatura da **tendência / raiz unitária**.
+- **Lags sazonais:** sobre esse decaimento aparecem **picos em 12 (≈ 0,83), 24 (≈ 0,63) e 36 (≈ 0,41)**, que também decaem devagar.
+    - Picos persistentes em $s, 2s, 3s$ são a assinatura de **sazonalidade estocástica**, que pede $\Delta_{12}$.
+- **PACF:** pico grande no lag 1 (≈ 0,85) e picos nos lags **12 (≈ 0,43) e 13 (≈ −0,63)**.
+    - O par 12/13 é o padrão de uma série que depende fortemente do mesmo mês do ano anterior.
+- **Bate com o gráfico de linha?** Sim: há tendência e sazonalidade anual. **Nenhum modelo ARMA deve ser identificado no nível.** Primeiro é preciso diferenciar.
+
+### Diferenciação
+
+Seguindo a ordem $D \to d$, aplicamos primeiro a **diferença sazonal** $\Delta_{12} Y_t = Y_t - Y_{t-12}$ (variação contra o mesmo mês do ano anterior). Só depois vemos se ainda falta a diferença regular.
+
+#### Diferença sazonal: $\Delta_{12} Y_t$
+
+```{python}
+#| execution: {iopub.execute_input: '2026-10-24T14:29:18.273059Z', iopub.status.busy: '2026-10-24T14:29:18.273005Z', iopub.status.idle: '2026-10-24T14:29:18.419039Z', shell.execute_reply: '2026-10-24T14:29:18.418634Z'}
+y_d12 = y.diff(12)
+plotar_diagnostico(y_d12, r'$\Delta_{12} Y_t$ — variação contra o mesmo mês do ano anterior')
+resumo_acf(y_d12)
+```
+
+**Leitura.**
+
+- A diferença sazonal **removeu os picos sazonais**: a ACF no lag 12 caiu de 0,83 para ≈ 0,06.
+- Mas a ACF ainda **decai lentamente** a partir de ≈ 0,73 e continua significativa até o lag ≈ 20.
+- No gráfico, $\Delta_{12} Y_t$ passa anos acima de zero (2007–13) e anos abaixo (2014–16). Isso é o ciclo econômico, que a diferença sazonal não remove.
+- Portanto **ainda falta a diferença regular** ($d = 1$). O teste KPSS na próxima seção vai confirmar.
+
+#### Contraprova: só a diferença regular, $\Delta Y_t$
+
+Para mostrar por que a ordem importa, vale ver o que acontece se aplicarmos **apenas** a diferença regular.
+
+```{python}
+#| execution: {iopub.execute_input: '2026-10-24T14:29:18.420125Z', iopub.status.busy: '2026-10-24T14:29:18.420065Z', iopub.status.idle: '2026-10-24T14:29:18.523224Z', shell.execute_reply: '2026-10-24T14:29:18.522802Z'}
+y_d1 = y.diff()
+plotar_diagnostico(y_d1, r'$\Delta Y_t$ — só a diferença regular (contraprova)')
+resumo_acf(y_d1)
+```
+
+**Leitura.**
+
+- A tendência some: a série oscila em torno de zero.
+- Mas a ACF tem **picos enormes e persistentes em 12 (≈ 0,83), 24 (≈ 0,78) e 36 (≈ 0,75)**, que praticamente não decaem. **A sazonalidade estocástica continua lá.**
+- Como veremos, o ADF declara $\Delta Y_t$ "estacionária". Mas **o ADF não vê sazonalidade**, então $D$ se decide olhando a ACF nos lags $s, 2s, 3s$.
+
+#### Diferença dupla: $\Delta \Delta_{12} Y_t$
+
+```{python}
+#| execution: {iopub.execute_input: '2026-10-24T14:29:18.524313Z', iopub.status.busy: '2026-10-24T14:29:18.524253Z', iopub.status.idle: '2026-10-24T14:29:18.624708Z', shell.execute_reply: '2026-10-24T14:29:18.624220Z'}
+y_dd = y.diff().diff(12)
+plotar_diagnostico(y_dd, r'$\Delta\Delta_{12} Y_t$ — diferença regular + sazonal')
+resumo_acf(y_dd)
+```
+
+**Leitura.** A série duplamente diferenciada oscila em torno de zero, sem tendência nem sazonalidade visível. O que sobra é o choque do Covid (abr–jun/2020) e o pico de mar/2023. A identificação dos termos ARMA segue a regra prática do Box-Jenkins estendido:
+
+- **Lags pequenos → $p, q$:**
+    - A ACF é significativa nos lags 1 (≈ −0,21) e 2 (≈ −0,13) e depois corta.
+    - A PACF também tem lags 1 e 2 negativos e significativos.
+    - Os candidatos são um **MA(1)/MA(2)** ou um **AR(2)** de baixa ordem. A tabela ACF/PACF raramente é limpa, e o AICc desempata.
+- **Lags sazonais → $P, Q$:**
+    - A ACF tem pico **negativo no lag 12 (≈ −0,39)** e nada no 24.
+    - A PACF decai nos lags sazonais: 12 (≈ −0,36), depois 24 (≈ −0,16).
+    - Pelo guia sazonal, pico na ACF em $s$ com PACF decaindo indica **SMA(1)**.
+- **Sobrediferenciação?** O lag 1 negativo é moderado (−0,21), longe do ≈ −0,5 que indicaria diferença em excesso. Ou seja, $d = 1$ e $D = 1$ não parecem exagerados.
+- **Lags isolados** (9, 11, 21, 33…) são esperados: com 36 lags a 5%, ≈ 2 falsos positivos acontecem por acaso. O Covid também infla algumas autocorrelações.
+
+**Candidato pela leitura manual: SARIMA$(0,1,1)(0,1,1)_{12}$ (o *airline model*)**, ou uma variante com mais um termo não-sazonal. Na Seção 7, conferimos se o `AutoARIMA` concorda.
+
+## Testes de raiz unitária (ADF, KPSS) e `ndiffs`
+
+Os testes têm **hipóteses nulas opostas**: o ADF tem $H_0$ de raiz unitária e o KPSS tem $H_0$ de estacionariedade. Por isso são usados **juntos**, numa lógica de triangulação. Aplicamos os dois às quatro versões da série.
+
+```{python}
+#| execution: {iopub.execute_input: '2026-10-24T14:29:18.625725Z', iopub.status.busy: '2026-10-24T14:29:18.625664Z', iopub.status.idle: '2026-10-24T14:29:18.635724Z', shell.execute_reply: '2026-10-24T14:29:18.635430Z'}
+testes = testar_estacionariedade({
+    'Nível  Y': y,
+    'Δ12 Y  (D=1)': y_d12,
+    'Δ Y    (d=1)': y_d1,
+    'ΔΔ12 Y (d=1, D=1)': y_dd,
+})
+testes
+```
+
+**Leitura.**
+
+| Série | ADF | KPSS | O que concluímos |
+|---|---|---|---|
+| Nível | não rejeita raiz unitária (p ≈ 0,21) | rejeita estacionariedade (p < 0,01) | **raiz unitária**: precisa diferenciar |
+| $\Delta_{12} Y$ | não rejeita (p ≈ 0,13) | rejeita (p ≈ 0,04) | **ainda há raiz unitária regular**: falta $d = 1$ |
+| $\Delta Y$ | rejeita (p ≈ 0,00) | não rejeita (p > 0,10) | "estacionária" para os testes, **mas a ACF mostrou sazonalidade intacta**, que o ADF não testa |
+| $\Delta\Delta_{12} Y$ | rejeita (p ≈ 0,00) | não rejeita (p > 0,10) | ✅ **estacionária** |
+
+O resultado conjunto dos testes e da ACF é **$d = 1$ e $D = 1$**.
+
+### `nsdiffs` e `ndiffs`, na ordem do `AutoARIMA`
+
+As funções do `statsforecast` reproduzem a lógica interna do `AutoARIMA`, na ordem $D \to d$:
+
+1. **`nsdiffs`** usa a heurística de força sazonal (`test="seas"`, limiar 0,64) para decidir $D$.
+2. **`ndiffs`** roda o KPSS sobre a série **já diferenciada sazonalmente** para decidir $d$.
+
+```{python}
+#| execution: {iopub.execute_input: '2026-10-24T14:29:18.636859Z', iopub.status.busy: '2026-10-24T14:29:18.636808Z', iopub.status.idle: '2026-10-24T14:29:18.640659Z', shell.execute_reply: '2026-10-24T14:29:18.640369Z'}
+x = y.to_numpy()
+
+forca_sazonal = seas_heuristic(x, S)
+D = nsdiffs(x, period=S)                                   # 1º passo: diferença sazonal
+x_sazonal = x[S:] - x[:-S] if D == 1 else x
+d = ndiffs(x_sazonal)                                      # 2º passo: KPSS em Δ12 Y
+
+print(f"Força sazonal (heurística seas): {forca_sazonal:.3f}  → limiar 0,64")
+print(f"nsdiffs  → D = {D}")
+print(f"ndiffs (KPSS em Δ12 Y) → d = {d}")
+print(f"ndiffs no nível, para comparação → d = {ndiffs(x)}")
+```
+
+**Leitura.**
+
+- A força sazonal calculada pelo `statsforecast` (≈ 0,82) supera o limiar de 0,64, então **$D = 1$**. O valor é próximo do $F_S$ da nossa STL; a diferença vem de detalhes da implementação.
+- Depois de $\Delta_{12}$, o KPSS ainda pede **$d = 1$**.
+- `ndiffs`/`nsdiffs` confirmam o que a análise manual já indicava. A estrutura de diferenciação esperada para o modelo é **$(\cdot, 1, \cdot)(\cdot, 1, \cdot)_{12}$**.
+
+## Modelagem: SARIMA via `AutoARIMA(season_length=12)`
+
+Esta é a **Etapa 2 do Box-Jenkins (Estimação)**. O `AutoARIMA` do `statsforecast` (algoritmo de Hyndman-Khandakar) segue estes passos:
+
+1. Define $D$ pela heurística sazonal e $d$ pelo KPSS (exatamente o que fizemos acima).
+2. Parte de um modelo simples e varia $p, q, P, Q$ em ±1 (*stepwise*).
+3. Fica com o menor **AICc**. Todos os candidatos têm os mesmos $d$ e $D$, então a comparação por AICc é legítima.
+
+Os parâmetros são estimados por máxima verossimilhança.
+
+```{python}
+#| execution: {iopub.execute_input: '2026-10-24T14:29:18.641666Z', iopub.status.busy: '2026-10-24T14:29:18.641613Z', iopub.status.idle: '2026-10-24T14:29:19.884315Z', shell.execute_reply: '2026-10-24T14:29:19.883877Z'}
+sf = StatsForecast(models=[AutoARIMA(season_length=S)], freq='MS', n_jobs=1)
+sf.fit(df=df_sf)
+
+modelo = sf.fitted_[0, 0].model_
+p, q, P, Q, s, d_mod, D_mod = modelo['arma']               # arma = (p, q, P, Q, s, d, D)
+nome_modelo = f"SARIMA({p},{d_mod},{q})({P},{D_mod},{Q})[{s}]"
+
+print(f"Modelo selecionado: {nome_modelo}")
+print(f"AICc = {modelo['aicc']:.2f}   AIC = {modelo['aic']:.2f}   BIC = {modelo['bic']:.2f}")
+print(f"σ² (variância do ruído) = {modelo['sigma2']:.2f}   →   σ = {np.sqrt(modelo['sigma2']):.2f} pontos de índice")
+print(f"Observações: {modelo['nobs']}")
+```
+
+```{python}
+#| execution: {iopub.execute_input: '2026-10-24T14:29:19.885358Z', iopub.status.busy: '2026-10-24T14:29:19.885301Z', iopub.status.idle: '2026-10-24T14:29:19.888597Z', shell.execute_reply: '2026-10-24T14:29:19.888176Z'}
+# Coeficientes, erros-padrão (matriz de variância do MLE) e teste z
+coef = pd.Series(modelo['coef'])
+ep = pd.Series(np.sqrt(np.diag(modelo['var_coef'])), index=coef.index)
+tabela_coef = pd.DataFrame({'coeficiente': coef, 'erro-padrão': ep, 'z': coef / ep})
+tabela_coef['p-valor'] = 2 * (1 - stats.norm.cdf(np.abs(tabela_coef['z'])))
+tabela_coef.round(4)
+```
+
+**Leitura.** O `AutoARIMA` escolheu **SARIMA$(2,1,1)(0,1,1)_{12}$**:
+
+$$(1 - \phi_1 B - \phi_2 B^2)(1-B)(1-B^{12})\,Y_t = (1 + \theta_1 B)(1 + \Theta_1 B^{12})\,\varepsilon_t$$
+
+- **Diferenças ($d = 1$, $D = 1$):** exatamente o que a ACF, o ADF/KPSS e o `ndiffs`/`nsdiffs` indicaram.
+- **Parte sazonal, SMA(1) com $\Theta_1 \approx -0{,}86$:** é o termo que a ACF de $\Delta\Delta_{12}Y$ sugeriu (pico negativo isolado no lag 12).
+    - Um $\Theta$ próximo de −1 quase cancela a diferença sazonal. Na prática, o modelo estima o padrão sazonal como uma **média longa dos anos anteriores**, que evolui devagar.
+    - Isso é coerente com a sazonalidade "que se desloca" vista na STL.
+- **Parte não-sazonal:**
+    - MA(1) com $\theta_1 \approx -0{,}80$ e AR(1) com $\phi_1 \approx 0{,}51$, ambos bem significativos.
+    - O $\phi_2 \approx 0{,}00$ não é significativo. A busca *stepwise* o manteve porque melhorou marginalmente o AICc, mas, por parcimônia, um SARIMA$(1,1,1)(0,1,1)_{12}$ seria praticamente equivalente.
+    - A combinação AR(1) + MA(1) gera ACF com lag 1 negativo seguido de decaimento rápido, compatível com os lags 1–2 negativos da ACF/PACF de $\Delta\Delta_{12}Y$.
+- **Comparação com a leitura manual:**
+    - O candidato manual era o *airline* $(0,1,1)(0,1,1)_{12}$. O `AutoARIMA` chegou à mesma estrutura de diferenças e ao mesmo SMA(1), e **acrescentou dinâmica AR de curto prazo**.
+    - Como os dois modelos têm os mesmos $d$ e $D$, a comparação por AICc é legítima. O próprio stepwise já avaliou o vizinho airline e o descartou.
+- **Tamanho do erro:** $\sigma \approx 4$ pontos de índice é o erro típico da previsão um passo à frente, cerca de 4% do nível atual.
+
+## Diagnóstico dos resíduos
+
+Esta é a **Etapa 3 do Box-Jenkins**. Se o modelo está correto, os resíduos são **ruído branco**: média zero, variância constante e sem autocorrelação. O diagnóstico é feito em três passos.
+
+### Passo 1: extrair os resíduos
+
+O resíduo é $\hat\varepsilon_t = y_t - \hat y_{t|t-1}$, o erro da previsão um passo à frente dentro da amostra. Os primeiros $d + D \cdot s = 13$ meses são consumidos pela diferenciação $\Delta\Delta_{12}$, e nesses pontos o resíduo é artificialmente ≈ 0. Por isso eles são **descartados** antes do diagnóstico.
+
+```{python}
+#| execution: {iopub.execute_input: '2026-10-24T14:29:19.889525Z', iopub.status.busy: '2026-10-24T14:29:19.889472Z', iopub.status.idle: '2026-10-24T14:29:21.145185Z', shell.execute_reply: '2026-10-24T14:29:21.144764Z'}
+# forecast() reajusta o mesmo modelo; fitted=True guarda os valores in-sample.
+# Aproveitamos a chamada para já gerar a previsão de 24 meses (Seção 9).
+H = 24
+previsao = sf.forecast(df=df_sf, h=H, level=[80, 95], fitted=True)
+insample = sf.forecast_fitted_values()
+insample['resid'] = insample['y'] - insample['AutoARIMA']
+
+n_cond = d_mod + D_mod * s                                 # observações "consumidas" pela diferenciação
+print("Primeiros resíduos (repare nos ≈ 0 iniciais):", insample['resid'].head(n_cond + 2).round(2).tolist())
+
+resid = insample['resid'].iloc[n_cond:].set_axis(insample['ds'].iloc[n_cond:])
+m = p + q + P + Q                                          # nº de parâmetros ARMA (correção do Ljung-Box)
+print(f"\nModelo: {nome_modelo}  →  m = p+q+P+Q = {m}")
+print(f"Resíduos: n = {len(resid)}, média = {resid.mean():.3f}, desvio-padrão = {resid.std():.3f}")
+```
+
+### Passo 2: os quatro gráficos de diagnóstico
+
+```{python}
+#| execution: {iopub.execute_input: '2026-10-24T14:29:21.146453Z', iopub.status.busy: '2026-10-24T14:29:21.146373Z', iopub.status.idle: '2026-10-24T14:29:21.284991Z', shell.execute_reply: '2026-10-24T14:29:21.284629Z'}
+fig, axes = plt.subplots(2, 2, figsize=(13, 8))
+
+# (1) Resíduos no tempo — média zero e variância constante
+axes[0, 0].plot(resid.index, resid.values, color=INSPER_GRAY, lw=0.8)
+axes[0, 0].axhline(0, color=INSPER_RED, lw=1)
+axes[0, 0].axvspan(*COVID, color=INSPER_AMARELO, alpha=0.3)
+for data in resid.abs().nlargest(2).index:                 # anota os dois maiores choques
+    axes[0, 0].annotate(mes_ano(data), (data, resid[data]), fontsize=8,
+                        xytext=(8, 0), textcoords='offset points')
+axes[0, 0].set_title('(1) Resíduos ao longo do tempo'); axes[0, 0].set_ylabel('resíduo')
+
+# (2) ACF dos resíduos — ausência de autocorrelação
+plot_acf(resid, lags=36, zero=False, ax=axes[0, 1], color=INSPER_GRAY,
+         vlines_kwargs={'colors': INSPER_GRAY})
+marcar_sazonais(axes[0, 1])
+axes[0, 1].set_title('(2) ACF dos resíduos')
+
+# (3) Histograma + densidade normal — normalidade
+axes[1, 0].hist(resid, bins=30, density=True, color=INSPER_GRAY, alpha=0.6, edgecolor='white')
+xg = np.linspace(resid.min(), resid.max(), 200)
+axes[1, 0].plot(xg, stats.norm.pdf(xg, resid.mean(), resid.std()), color=INSPER_RED, lw=2,
+                label='Normal teórica')
+axes[1, 0].set_title('(3) Distribuição dos resíduos'); axes[1, 0].legend()
+
+# (4) Q-Q plot — normalidade nas caudas
+qqplot(resid, line='s', ax=axes[1, 1], markerfacecolor=INSPER_GRAY,
+       markeredgecolor=INSPER_GRAY, alpha=0.5)
+axes[1, 1].get_lines()[1].set_color(INSPER_RED)
+axes[1, 1].set_title('(4) Q-Q plot (normalidade)')
+
+plt.suptitle(f'Diagnóstico dos resíduos — {nome_modelo}', fontweight='bold')
+plt.tight_layout(); plt.show()
+```
+
+```{python}
+#| execution: {iopub.execute_input: '2026-10-24T14:29:21.286186Z', iopub.status.busy: '2026-10-24T14:29:21.286116Z', iopub.status.idle: '2026-10-24T14:29:21.291828Z', shell.execute_reply: '2026-10-24T14:29:21.291513Z'}
+# Onde estão os maiores resíduos? E quais lags da ACF residual saem da banda?
+display(insample.assign(abs_resid=insample['resid'].abs())
+        .nlargest(5, 'abs_resid')[['ds', 'y', 'AutoARIMA', 'resid']].round(2)
+        .rename(columns={'AutoARIMA': 'ajustado (1 passo)'}))
+
+ac_res = acf(resid, nlags=36)
+banda = 1.96 / np.sqrt(len(resid))
+print("Lags da ACF residual fora da banda ±%.3f:" % banda,
+      {l: round(ac_res[l], 3) for l in range(1, 37) if abs(ac_res[l]) > banda})
+jb = stats.jarque_bera(resid)
+print(f"Jarque-Bera (H0: normalidade): estatística = {jb.statistic:.1f}, p-valor = {jb.pvalue:.2e}")
+print(f"Curtose em excesso = {stats.kurtosis(resid):.2f}  (Normal = 0)")
+```
+
+### Passo 3: teste formal de Ljung-Box
+
+$H_0$: os resíduos são ruído branco. Como estimamos $m = p+q+P+Q = 4$ parâmetros ARMA, informamos `model_df=m`, e a estatística passa a seguir uma $\chi^2_{h-m}$. Testamos nos lags sazonais $h = 12, 24, 36$.
+
+```{python}
+#| execution: {iopub.execute_input: '2026-10-24T14:29:21.292965Z', iopub.status.busy: '2026-10-24T14:29:21.292897Z', iopub.status.idle: '2026-10-24T14:29:21.295936Z', shell.execute_reply: '2026-10-24T14:29:21.295520Z'}
+lb = acorr_ljungbox(resid, lags=[12, 24, 36], model_df=m)
+lb.index.name = 'lag (h)'
+display(lb.round(4))
+
+alpha = 0.05
+for h, pval in lb['lb_pvalue'].items():
+    veredito = 'não rejeita H0 (compatível com ruído branco)' if pval > alpha else 'REJEITA H0 (autocorrelação remanescente)'
+    print(f"h = {h:>2}: p = {pval:.3f} → {veredito}")
+```
+
+**Leitura.** A ordem de prioridade é: (1) autocorrelação, (2) variância constante e (3) normalidade.
+
+1. **Autocorrelação.**
+    - Na ACF residual, **um único lag sai da banda: o lag 12** (≈ 0,16).
+    - O Ljung-Box **rejeita no horizonte $h = 12$** (p ≈ 0,04) e **não rejeita em $h = 24$ e $h = 36$** (p ≈ 0,19 e 0,33).
+    - Ou seja, os resíduos são *quase* ruído branco, com **um resto de correlação sazonal no lag 12**.
+    - É coerente com a descritiva: o padrão de dezembro vem encolhendo, e um único SMA(1) com $\Theta \approx -0{,}86$ (média sazonal longa) não acompanha totalmente essa mudança.
+2. **Variância e média.**
+    - Média ≈ −0,20 contra desvio ≈ 4,0: não há viés sistemático.
+    - A variância é razoavelmente estável, com dois choques claros: **abr/2020** (Covid, resíduo ≈ −25) e **mar/2023** (≈ +17).
+3. **Normalidade.**
+    - O Jarque-Bera rejeita com folga, e o Q-Q plot mostra **caudas pesadas** causadas por esses poucos meses extremos.
+    - As previsões pontuais continuam válidas, mas os **intervalos de previsão tendem a ser otimistas** (mais estreitos do que deveriam).
+
+**Veredito:** o modelo captura a tendência, a sazonalidade e a dinâmica de curto prazo, com uma ressalva no lag 12 (Ljung-Box marginal). Pela regra do Box-Jenkins, o próximo ciclo voltaria à identificação e testaria um termo sazonal extra (SAR(1) + SMA(1)) ou intervenções para Covid e efeitos de calendário. Isso fica fora do escopo pedido. Para a previsão a seguir, o resultado é aceitável, desde que se leve em conta essa ressalva.
+
+## Previsão: 24 meses à frente
+
+Esta é a **Etapa 4 do Box-Jenkins**. A previsão já foi gerada na Seção 8 (`sf.forecast(..., h=24, level=[80, 95])`), com o mesmo modelo SARIMA$(2,1,1)(0,1,1)_{12}$.
+
+```{python}
+#| execution: {iopub.execute_input: '2026-10-24T14:29:21.296874Z', iopub.status.busy: '2026-10-24T14:29:21.296816Z', iopub.status.idle: '2026-10-24T14:29:21.397920Z', shell.execute_reply: '2026-10-24T14:29:21.397502Z'}
+def plot_previsao(ax, inicio=None, titulo=''):
+    hist = df_sf if inicio is None else df_sf[df_sf['ds'] >= inicio]
+    ax.plot(hist['ds'], hist['y'], color=INSPER_GRAY, lw=1, label='Histórico')
+    ax.fill_between(previsao['ds'], previsao['AutoARIMA-lo-95'], previsao['AutoARIMA-hi-95'],
+                    color=INSPER_RED, alpha=0.12, label='IC 95%')
+    ax.fill_between(previsao['ds'], previsao['AutoARIMA-lo-80'], previsao['AutoARIMA-hi-80'],
+                    color=INSPER_RED, alpha=0.25, label='IC 80%')
+    ax.plot(previsao['ds'], previsao['AutoARIMA'], color=INSPER_RED, lw=2, label=nome_modelo)
+    ax.axvline(df_sf['ds'].max(), color='gray', ls=':', lw=1)
+    ax.set_title(titulo, fontweight='bold'); ax.set_ylabel('Índice de volume')
+    ax.legend(loc='upper left', fontsize=9)
+
+
+fig, axes = plt.subplots(2, 1, figsize=(13, 9))
+plot_previsao(axes[0], titulo=f'PMC {MINHA_UF} — previsão de 24 meses (histórico completo)')
+plot_previsao(axes[1], inicio='2021-01-01', titulo='Zoom: 2021 em diante')
+plt.tight_layout(); plt.show()
+```
+
+```{python}
+#| execution: {iopub.execute_input: '2026-10-24T14:29:21.399054Z', iopub.status.busy: '2026-10-24T14:29:21.398983Z', iopub.status.idle: '2026-10-24T14:29:21.404295Z', shell.execute_reply: '2026-10-24T14:29:21.403888Z'}
+# Tabela da previsão + largura dos intervalos por horizonte
+tab_prev = previsao.drop(columns='unique_id').copy()
+tab_prev.insert(0, 'h', range(1, H + 1))
+tab_prev['largura IC80'] = tab_prev['AutoARIMA-hi-80'] - tab_prev['AutoARIMA-lo-80']
+tab_prev['largura IC95'] = tab_prev['AutoARIMA-hi-95'] - tab_prev['AutoARIMA-lo-95']
+tab_prev['ds'] = tab_prev['ds'].map(mes_ano)
+tab_prev = tab_prev.rename(columns={'ds': 'mês', 'AutoARIMA': 'previsão',
+                                    'AutoARIMA-lo-95': 'lo 95', 'AutoARIMA-lo-80': 'lo 80',
+                                    'AutoARIMA-hi-80': 'hi 80', 'AutoARIMA-hi-95': 'hi 95'})
+tab_prev[['h', 'mês', 'lo 95', 'lo 80', 'previsão', 'hi 80', 'hi 95',
+          'largura IC80', 'largura IC95']].round(1).set_index('h')
+```
+
+```{python}
+#| execution: {iopub.execute_input: '2026-10-24T14:29:21.405242Z', iopub.status.busy: '2026-10-24T14:29:21.405187Z', iopub.status.idle: '2026-10-24T14:29:21.410006Z', shell.execute_reply: '2026-10-24T14:29:21.409691Z'}
+# Âncora no histórico: previsão vs. o mesmo mês do último ano observado
+ultimo_ano = y['2025-03-01':'2026-02-01'].to_numpy()
+comparacao = pd.DataFrame({
+    'mês': [MESES[m - 1] for m in previsao['ds'].dt.month.iloc[:12]],
+    'observado (mar/25–fev/26)': ultimo_ano,
+    'previsto 1º ano': previsao['AutoARIMA'].iloc[:12].values,
+    'previsto 2º ano': previsao['AutoARIMA'].iloc[12:].values,
+})
+comparacao['previsto 1º − observado'] = comparacao['previsto 1º ano'] - comparacao['observado (mar/25–fev/26)']
+comparacao.round(1)
+```
+
+**Leitura.**
+
+- **Captura a sazonalidade?** Sim.
+    - A previsão reproduz o perfil do ano: pico de **dezembro** (≈ 116 em dez/2026 e dez/2027), vales em **janeiro–fevereiro** (≈ 90–96) e as oscilações menores de abril, junho e setembro.
+    - É o que o SARIMA acrescenta ao ARIMA puro: a sazonalidade **projetada para fora da amostra**.
+- **Bem ancorada no histórico?** Em grande parte.
+    - O nível médio projetado fica em ≈ 100, o patamar observado desde 2021, quase sem tendência. Os dois anos previstos são praticamente iguais (o 2º fica ≈ 0,5 ponto acima).
+    - **Mar–mai/2026 saem 5–6 pontos abaixo dos mesmos meses de 2025.** O modelo carrega o início fraco de 2026 (fev/2026 = 89,2, ≈ 7 pontos abaixo de fev/2025) pelo AR(1) e pela diferença regular. É a ancoragem no dado mais recente, não um erro.
+    - De junho a novembro, a previsão fica a ±1,5 ponto do observado no ano anterior.
+    - O ponto fraco é **dezembro**: a previsão (≈ 116) fica ≈ 4 pontos acima de dez/2025 (112,5). O SMA(1) pondera o perfil sazonal de vários anos, quando dezembro ainda pesava mais. É o mesmo sinal do lag 12 no diagnóstico.
+- **Os intervalos abrem muito com o horizonte?** Sim, como esperado de um modelo **integrado** ($d = 1$, $D = 1$), cuja variância de previsão cresce sem limite.
+    - O IC 95% vai de ≈ 16 pontos de largura em $h = 1$ para ≈ 28 em $h = 12$ e ≈ 39 em $h = 24$. Em dez/2027, o intervalo vai de ≈ 98 a ≈ 136.
+    - Como os resíduos têm caudas pesadas, esses intervalos provavelmente ainda **subestimam** a incerteza real, por exemplo diante de choques como o Covid.
+
+## Discussão
+
+**1. O ACF/PACF da série original sugeriu sazonalidade? E tendência? Bate com o que você viu no gráfico de linha?**
+
+Sim aos dois. A ACF do nível decai muito lentamente ($\rho_1 \approx 0{,}85$, todos os 36 lags significativos), o que é tendência e raiz unitária. Sobre esse decaimento há picos em 12, 24 e 36 (0,83, 0,63, 0,41), a assinatura de sazonalidade estocástica anual. Na PACF, o par de picos nos lags 12 e 13 reforça a dependência do mesmo mês do ano anterior. Isso bate com o gráfico de linha: crescimento até 2013, queda em 2014–16, patamar ≈ 100 desde 2021 e o pico de dezembro todo ano. A STL confirmou os dois componentes como fortes ($F_T \approx 0{,}95$, $F_S \approx 0{,}77$) e mostrou que a amplitude sazonal muda ao longo do tempo.
+
+**2. Quantas diferenças (regular e sazonal) o AutoARIMA aplicou? E os componentes AR/MA? Conseguiu observar isso no ACF/PACF?**
+
+O modelo escolhido foi SARIMA$(2,1,1)(0,1,1)_{12}$: **uma diferença regular e uma sazonal**. É exatamente o que vimos nos dados: em $\Delta_{12}Y$ a ACF ainda decaía devagar e o KPSS rejeitava, e só $\Delta\Delta_{12}Y$ passou nos dois testes, com `nsdiffs` = 1 e `ndiffs` = 1. O **SMA(1)** ($\Theta \approx -0{,}86$) aparece claramente na ACF de $\Delta\Delta_{12}Y$, com pico negativo isolado no lag 12 e a PACF decaindo em 12 e 24. Na parte não-sazonal, os lags 1–2 negativos sugeriam um MA ou AR de baixa ordem. O AutoARIMA combinou AR(1) ($\phi_1 \approx 0{,}51$) e MA(1) ($\theta_1 \approx -0{,}80$) e manteve um $\phi_2 \approx 0$ não significativo. A identificação manual (*airline*) acertou as diferenças e o termo sazonal; o AutoARIMA refinou a dinâmica de curto prazo.
+
+**3. Os resíduos parecem white noise? Algum padrão remanescente sazonal?**
+
+Quase. A média é ≈ 0, a variância é razoavelmente estável (fora o Covid em abr/2020 e mar/2023), e o Ljung-Box não rejeita em $h = 24$ e $36$. **Mas sobra correlação no lag 12** (≈ 0,16, o único lag fora da banda), e o Ljung-Box em $h = 12$ rejeita a 5% (p ≈ 0,04). É um resto sazonal, coerente com a perda de peso de dezembro ao longo dos anos (de 1,28× para 1,11× a média anual). Os resíduos também não são normais (caudas pesadas por causa dos choques), o que torna os intervalos otimistas.
+
+**4. A previsão pareceu razoável visualmente (captura a sazonalidade, fica bem ancorada no histórico, intervalos abrem muito com o horizonte)?**
+
+Sim, com ressalvas. A previsão reproduz bem o perfil sazonal (pico em dezembro, vale em fevereiro) e fica ancorada no patamar ≈ 100 dos últimos anos, sem inventar tendência. Os primeiros meses (mar–mai/2026) saem 5–6 pontos abaixo de 2025, porque o modelo propaga o início fraco de 2026. O dezembro projetado (≈ 116) parece alto diante de dez/2025 (112,5), reflexo do mesmo resto sazonal do item 3. Os intervalos abrem bastante, como é natural num modelo com $d = 1$ e $D = 1$: o IC 95% passa de ≈ 16 pontos em $h = 1$ para ≈ 39 em $h = 24$. Mesmo assim, provavelmente subestimam o risco de choques.
+
+**5. Que outras UFs você imagina que dariam um SARIMA bem diferente do seu (e por quê)?**
+
+São Paulo é uma série longa, de economia grande e diversificada, com sazonalidade de varejo clássica (Natal) e tendência guiada pelo ciclo nacional. Hipóteses de UFs que dariam modelos diferentes:
+
+- **Estados pequenos do Norte (Amapá, Roraima, Acre):** séries com muito mais ruído e crescimento estrutural forte. Devem pedir transformação log (variância crescente com o nível) e talvez ter sazonalidade relativamente mais fraca, ou $D = 0$.
+- **Estados do agronegócio (Mato Grosso, Goiás, Mato Grosso do Sul):** como o varejo **ampliado** inclui veículos e materiais de construção, o calendário da safra pode deslocar o pico para o 1º semestre e criar tendência de crescimento mais acentuada.
+- **Rio Grande do Sul:** a enchente de maio/2024 é um outlier tão forte quanto o Covid e exigiria intervenção.
+- **Distrito Federal:** a renda ancorada no setor público deve produzir uma série menos cíclica, com tendência mais suave e menos sensível às recessões.
+
